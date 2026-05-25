@@ -120,6 +120,8 @@ local order = {
         "menu_activate",
     },
     tools = {
+        "pencil_annotation",
+        "----------------------------",
         "read_timer",
         "calibre",
         "exporter",
