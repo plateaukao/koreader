@@ -174,6 +174,8 @@ local order = {
         "long_press",
     },
     tools = {
+        "pencil_annotation",
+        "----------------------------",
         "read_timer",
         "calibre",
         "exporter",
