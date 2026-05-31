@@ -27,6 +27,8 @@ local KEY_RELEASE = 0
 -- Based on ABS_MT_TOOL_TYPE values on Elan panels
 local TOOL_TYPE_FINGER = 0
 local TOOL_TYPE_PEN    = 1
+local TOOL_TYPE_ERASER = 2
+local TOOL_TYPE_HIGHLIGHTER = 3
 
 -- For debug logging of ev.type
 local linux_evdev_type_map = {
@@ -451,6 +453,72 @@ function Input:gestureAdjustHook(ges)
     -- do nothing by default
 end
 
+--[[--
+Register a callback for stylus/pen events.
+Called before gesture detection with fully-processed slot data.
+The callback receives the Input object and a slot table: {slot, id, x, y, tool, timev}
+Return true from the callback to "dominate" the event (remove from gesture detection).
+@param callback function(input, slot)
+]]
+function Input:registerStylusCallback(callback)
+    self.stylus_callback = callback
+    logger.info("Input: stylus callback registered, pen_slot =", self.pen_slot)
+end
+
+function Input:unregisterStylusCallback()
+    self.stylus_callback = nil
+    logger.info("Input: stylus callback unregistered")
+end
+
+--[[--
+Filter stylus events from MTSlots and route to callback.
+Called before gesture detection. Modifies self.MTSlots in place.
+--]]
+function Input:routeStylusEvents()
+    if not self.stylus_callback or #self.MTSlots == 0 then
+        return
+    end
+
+    local dominated_indices = {}
+
+    for i, slot in ipairs(self.MTSlots) do
+        -- Identify stylus by tool type OR pen slot (pen tip or eraser end)
+        -- On Kobo, ABS_MT_TOOL_TYPE is sent: 0=finger, 1=stylus
+        local is_stylus = (slot.tool == TOOL_TYPE_PEN) or
+                          (slot.tool == TOOL_TYPE_ERASER) or
+                          (self.pen_slot and slot.slot == self.pen_slot)
+
+        if is_stylus then
+            -- On Kobo, eraser END still reports tool=1 (PEN) via ABS_MT_TOOL_TYPE,
+            -- but also sends BTN_STYLUS. Override to ERASER when that's active.
+            -- Only do this for tool=PEN to avoid affecting fingers (tool=0)
+            -- Based on eraser detection pattern from eraser.koplugin by SimonLiu
+            -- Highlighter works in the same way, but eraser takes priority
+            if slot.tool == TOOL_TYPE_PEN then
+                if self.kobo_eraser_active then
+                    slot.tool = TOOL_TYPE_ERASER
+                elseif self.kobo_highlighter_active then
+                    slot.tool = TOOL_TYPE_HIGHLIGHTER
+                end
+            end
+
+            logger.dbg("Input:routeStylusEvents: stylus detected in slot", slot.slot,
+                       "tool=", slot.tool, "id=", slot.id, "x=", slot.x, "y=", slot.y,
+                       "pen_slot=", self.pen_slot, "kobo_eraser=", self.kobo_eraser_active, "kobo_highlighter=", self.kobo_highlighter_active)
+            local dominated = self.stylus_callback(self, slot)
+            if dominated then
+                table.insert(dominated_indices, i)
+                logger.dbg("Input:routeStylusEvents: slot", slot.slot, "dominated, will remove from gesture detection")
+            end
+        end
+    end
+
+    -- Remove dominated slots in reverse order (preserves indices)
+    for i = #dominated_indices, 1, -1 do
+        table.remove(self.MTSlots, dominated_indices[i])
+    end
+end
+
 --- Catalog of predefined hooks.
 -- These are *not* usable directly as hooks, they're just building blocks (c.f., Kobo)
 function Input:adjustABS_SwitchXY(ev)
@@ -671,22 +739,49 @@ function Input:handleKeyBoardEv(ev)
 
             return
         end
-    elseif self.wacom_protocol then
-        if ev.code == C.BTN_TOOL_PEN then
-            -- Switch to the dedicated pen slot, and make sure it's active, as this can come in a dedicated input frame
-            self:setupSlotData(self.pen_slot)
-            if ev.value == 1 then
-                self:setCurrentMtSlot("tool", TOOL_TYPE_PEN)
-            else
-                self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
-                -- Switch back to our main finger slot
-                self.cur_slot = self.main_finger_slot
-            end
+    end
 
-            return
-        elseif ev.code == C.BTN_TOUCH then
-            -- BTN_TOUCH is bracketed by BTN_TOOL_PEN, so we can limit this to pens, to avoid stomping on panel slots.
-            if self:getCurrentMtSlotData("tool") == TOOL_TYPE_PEN then
+    -- Track eraser end state via BTN_STYLUS (code 331) on Kobo
+    -- When eraser end touches screen, Kobo sends BTN_STYLUS press
+    -- This is mapped to "Eraser" in Kobo's event_map
+    -- Discovery based on eraser.koplugin by SimonLiu <simonliu423@gmail.com>
+    -- We just track the state here; routeStylusEvents will use it
+    if ev.code == C.BTN_STYLUS then
+        self.kobo_eraser_active = (ev.value == 1)
+    end
+
+    -- Track highlighter state via BTN_STYLUS2 (code 332) on Kobo
+    -- When side button is pressed as the stylus touches screen, Kobo sends BTN_STYLUS2 press
+    if ev.code == C.BTN_STYLUS2 then
+        self.kobo_highlighter_active = (ev.value == 1)
+    end
+
+    -- Handle stylus tool type for all protocols (pen tip vs eraser end)
+    if ev.code == C.BTN_TOOL_PEN then
+        self:setupSlotData(self.pen_slot)
+        if ev.value == 1 then
+            self:setCurrentMtSlot("tool", TOOL_TYPE_PEN)
+        else
+            self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
+            self.cur_slot = self.main_finger_slot
+        end
+        return
+    elseif ev.code == C.BTN_TOOL_RUBBER then
+        self:setupSlotData(self.pen_slot)
+        if ev.value == 1 then
+            self:setCurrentMtSlot("tool", TOOL_TYPE_ERASER)
+        else
+            self:setCurrentMtSlot("tool", TOOL_TYPE_FINGER)
+            self.cur_slot = self.main_finger_slot
+        end
+        return
+    end
+
+    if self.wacom_protocol then
+        if ev.code == C.BTN_TOUCH then
+            -- BTN_TOUCH is bracketed by BTN_TOOL_PEN/BTN_TOOL_RUBBER, so we can limit this to styluses, to avoid stomping on panel slots.
+            local tool = self:getCurrentMtSlotData("tool")
+            if tool == TOOL_TYPE_PEN or tool == TOOL_TYPE_ERASER then
                 -- Make sure the pen slot is active, as this can come in a dedicated input frame
                 -- (i.e., we need it to be referenced by self.MTSlots for the lift to be picked up in the EV_SYN:SYN_REPORT handler).
                 -- (Conversely, getCurrentMtSlotData pokes at the *persistent* slot data in self.ev_slots,
@@ -962,6 +1057,8 @@ function Input:handleTouchEv(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            -- route stylus events before gesture detection
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -1003,6 +1100,8 @@ function Input:handleMixedTouchEv(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            -- route stylus events before gesture detection
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -1068,6 +1167,8 @@ function Input:handleTouchEvSnow(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            -- route stylus events before gesture detection
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -1128,6 +1229,8 @@ function Input:handleTouchEvPhoenix(ev)
             for _, MTSlot in ipairs(self.MTSlots) do
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
+            -- route stylus events before gesture detection
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -1177,6 +1280,8 @@ function Input:handleTouchEvLegacy(ev)
                 self:setMtSlot(MTSlot.slot, "timev", time.timeval(ev.time))
             end
 
+            -- route stylus events before gesture detection
+            self:routeStylusEvents()
             -- feed ev in all slots to state machine
             local touch_gestures = self.gesture_detector:feedEvent(self.MTSlots)
             self:newFrame()
@@ -1702,5 +1807,10 @@ function Input:inhibitInputUntil(set_or_seconds)
     UIManager:scheduleIn(delay_s, self._inhibitInputUntil_func)
     self:inhibitInput(true)
 end
+
+-- Export tool type constants for plugins
+Input.TOOL_TYPE_FINGER = TOOL_TYPE_FINGER  -- 0
+Input.TOOL_TYPE_PEN = TOOL_TYPE_PEN        -- 1
+Input.TOOL_TYPE_ERASER = TOOL_TYPE_ERASER  -- 2
 
 return Input
