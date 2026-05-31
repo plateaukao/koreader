@@ -1,0 +1,114 @@
+name: Release Android APK
+
+# Build a signed Android APK and publish it as a GitHub Release whenever a
+# `sony-dpt-v*` tag is pushed. Can also be triggered manually from the
+# Actions tab to produce a draft release for any commit.
+on:
+  push:
+    tags:
+      - 'sony-dpt-v*'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'kodev release target'
+        type: choice
+        default: 'android-arm'
+        options:
+          - android-arm
+          - android-arm64
+      draft:
+        description: 'Create the release as a draft'
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-android-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed for gh release create
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    env:
+      KOANDROID_IMAGE: koreader/koandroid:0.9.7-22.04
+      TARGET: ${{ github.event.inputs.target || 'android-arm' }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Full history so `git describe` inside the container produces the
+          # same version stamp we'd get locally.
+          fetch-depth: 0
+
+      - name: Cache koandroid Docker image
+        id: docker-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/koandroid.tar
+          key: koandroid-${{ env.KOANDROID_IMAGE }}
+
+      - name: Load cached image
+        if: steps.docker-cache.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/koandroid.tar
+
+      - name: Pull koandroid image
+        if: steps.docker-cache.outputs.cache-hit != 'true'
+        run: |
+          docker pull --platform linux/amd64 "$KOANDROID_IMAGE"
+          docker save "$KOANDROID_IMAGE" -o /tmp/koandroid.tar
+
+      - name: Build + sign APK
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD:/home/ko/koreader" -w /home/ko/koreader \
+            --entrypoint bash "$KOANDROID_IMAGE" \
+            -lc "./kodev release $TARGET && \
+                 uber-apk-signer --apks koreader-$TARGET-*.apk --allowResign --overwrite"
+
+      - name: Find APK
+        id: apk
+        run: |
+          apk=$(ls koreader-${TARGET}-*.apk | head -1)
+          if [ -z "$apk" ]; then
+            echo "::error::No APK produced"
+            exit 1
+          fi
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$apk")" >> "$GITHUB_OUTPUT"
+          echo "Built: $apk"
+          ls -la "$apk"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release (on tag push)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --generate-notes \
+            "${{ steps.apk.outputs.path }}"
+
+      - name: Create draft release (on manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.draft == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="ci-$(date -u +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
+          gh release create "$tag" \
+            --title "CI build $tag" \
+            --draft \
+            --notes "Manual workflow_dispatch build from $(git rev-parse HEAD)." \
+            "${{ steps.apk.outputs.path }}"
