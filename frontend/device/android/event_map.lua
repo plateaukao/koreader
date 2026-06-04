@@ -27,7 +27,10 @@ return {
     [84] = "Search",--SEARCH
     [92] = "LPgBack", -- PAGE_UP
     [93] = "LPgFwd",  -- PAGE_DOWN
-    [310] = "LPgFwd",  -- Supernote right sidebar forward
-    [301] = "LPgBack", -- Supernote right sidebar back
+    -- Supernote right sidebar page-turn (310/301) intentionally disabled:
+    -- the filtering logic that turns long-press / slide into well-behaved
+    -- page turns lives in launcher-side code that hasn't been pushed yet,
+    -- so without it the sidebar fires runaway page turns on contact.
+    -- Re-add [310] = "LPgFwd" and [301] = "LPgBack" once that lands.
     [300] = "SidebarDoubleFinger", -- Supernote left sidebar double-finger release
 }
