@@ -259,6 +259,10 @@ function Pencil:init()
     -- pencil bookmarks open the saved image.
     self:installBookmarkHook()
 
+    -- One-time cleanup: earlier version accidentally persisted these
+    G_reader_settings:delSetting("page_turns_disable_tap")
+    G_reader_settings:delSetting("page_turns_disable_swipe")
+
     logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.current_tool, "strokes =", #self.strokes)
 end
 
@@ -1770,7 +1774,10 @@ end
 
 -- Handle stylus button and tool events
 function Pencil:onKeyPress(key)
-    local key_str = tostring(key)
+    if not key then return false end
+    if key.key == "SidebarDoubleFinger" then return true end
+    local ok, key_str = pcall(tostring, key)
+    if not ok then key_str = "unknown" end
 
     -- Always log key events when debug mode is on (even if not enabled)
     if self.input_debug_mode then
@@ -1820,7 +1827,16 @@ function Pencil:onKeyPress(key)
 end
 
 function Pencil:onKeyRelease(key)
-    local key_str = tostring(key)
+    if not key then return false end
+
+    -- Supernote left sidebar double-finger: toggle pencil/eraser
+    if key.key == "SidebarDoubleFinger" and self:isEnabled() then
+        self:onPencilToggleTool()
+        return true
+    end
+
+    local ok, key_str = pcall(tostring, key)
+    if not ok then key_str = "unknown" end
 
     -- Always log key events when debug mode is on (even if not enabled)
     if self.input_debug_mode then
@@ -2905,11 +2921,9 @@ end
 function Pencil:onDrawTap(ges)
     if not self:isEnabled() or self:isOverlayActive() then return false end
 
-    -- If raw input detected pen recently, block tap to prevent navigation
-    -- Note: pen_down will be false by tap time, but we may have just drawn
-    -- We should block taps if there's a current stroke or recent drawing
-    if self.current_stroke then
-        return true  -- Block tap while stroke in progress
+    -- Block all taps while stylus is actively drawing
+    if self.pen_down or self.current_stroke then
+        return true
     end
 
     -- Rotation badge hit-test: consume taps (pen or finger) over the camera
