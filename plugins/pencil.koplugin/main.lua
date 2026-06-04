@@ -259,6 +259,10 @@ function Pencil:init()
     -- pencil bookmarks open the saved image.
     self:installBookmarkHook()
 
+    -- One-time cleanup: earlier version accidentally persisted these
+    G_reader_settings:delSetting("page_turns_disable_tap")
+    G_reader_settings:delSetting("page_turns_disable_swipe")
+
     logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.current_tool, "strokes =", #self.strokes)
 end
 
@@ -1820,6 +1824,7 @@ function Pencil:onKeyPress(key)
 end
 
 function Pencil:onKeyRelease(key)
+    if not key then return false end
     local key_str = tostring(key)
 
     -- Always log key events when debug mode is on (even if not enabled)
