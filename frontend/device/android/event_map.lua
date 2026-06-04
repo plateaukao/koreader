@@ -29,4 +29,5 @@ return {
     [93] = "LPgFwd",  -- PAGE_DOWN
     [310] = "LPgFwd",  -- Supernote right sidebar forward
     [301] = "LPgBack", -- Supernote right sidebar back
+    [300] = "SidebarDoubleFinger", -- Supernote left sidebar double-finger release
 }
