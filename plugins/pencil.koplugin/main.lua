@@ -327,7 +327,7 @@ function Pencil:onPencilToggleTool()
     local display_name = self.current_tool == TOOL_PEN and _("pencil") or _("eraser")
     UIManager:show(InfoMessage:new{
         text = T(_("Tool: %1"), display_name),
-        timeout = 1,
+        timeout = 0.3,
     })
     return true
 end
@@ -356,7 +356,7 @@ function Pencil:onPencilSelectPen()
     self:applySupernotePen()
     UIManager:show(InfoMessage:new{
         text = _("Pencil tool: pencil"),
-        timeout = 1,
+        timeout = 0.3,
     })
     return true
 end
@@ -366,7 +366,7 @@ function Pencil:onPencilSelectEraser()
     self:applySupernotePen()
     UIManager:show(InfoMessage:new{
         text = _("Eraser selected"),
-        timeout = 1,
+        timeout = 0.3,
     })
     return true
 end
@@ -1373,7 +1373,7 @@ function Pencil:setTool(tool)
     local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
     UIManager:show(InfoMessage:new{
         text = T(_("Tool: %1"), display_name),
-        timeout = 1,
+        timeout = 0.3,
     })
 end
 
@@ -1768,7 +1768,7 @@ function Pencil:togglePenEraser()
     -- Show brief visual feedback
     UIManager:show(InfoMessage:new{
         text = T(_("Tool: %1"), new_tool),
-        timeout = 0.5,
+        timeout = 0.3,
     })
 end
 
