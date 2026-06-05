@@ -266,6 +266,27 @@ function Pencil:init()
     logger.info("Pencil: initialized, enabled =", self:isEnabled(), "tool =", self.current_tool, "strokes =", #self.strokes)
 end
 
+-- Paint a tiny tool-state indicator in the top-right corner: a filled
+-- black square for pen, a hollow square for eraser. Direct Screen.bb
+-- paint + a partial refreshFast on just the badge's region — no setDirty,
+-- no widget, no scheduled close. The badge lingers until the next page
+-- repaint wipes it, then re-appears on the next tool change.
+local TOOL_BADGE_SIZE = 20
+local TOOL_BADGE_MARGIN = 8
+local TOOL_BADGE_BORDER = 2
+function Pencil:showToolBadge()
+    local size = TOOL_BADGE_SIZE
+    local x = Screen:getWidth() - size - TOOL_BADGE_MARGIN
+    local y = TOOL_BADGE_MARGIN
+    if self.current_tool == TOOL_ERASER then
+        Screen.bb:paintRect(x, y, size, size, Blitbuffer.COLOR_WHITE)
+        Screen.bb:paintBorder(x, y, size, size, TOOL_BADGE_BORDER, Blitbuffer.COLOR_BLACK)
+    else
+        Screen.bb:paintRect(x, y, size, size, Blitbuffer.COLOR_BLACK)
+    end
+    Screen:refreshFast(x, y, size, size)
+end
+
 -- Palm rejection: while the pen tip is on the screen, any finger touch is
 -- almost certainly the user's palm resting on the device. Without rejection
 -- the palm becomes a Swipe gesture, which ReaderPaging interprets as a page
@@ -324,11 +345,7 @@ function Pencil:onPencilToggleTool()
         self.current_tool = TOOL_ERASER
     end
     self:applySupernotePen()
-    local display_name = self.current_tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 0.3,
-    })
+    self:showToolBadge()
     return true
 end
 
@@ -354,20 +371,14 @@ end
 function Pencil:onPencilSelectPen()
     self.current_tool = TOOL_PEN
     self:applySupernotePen()
-    UIManager:show(InfoMessage:new{
-        text = _("Pencil tool: pencil"),
-        timeout = 0.3,
-    })
+    self:showToolBadge()
     return true
 end
 
 function Pencil:onPencilSelectEraser()
     self.current_tool = TOOL_ERASER
     self:applySupernotePen()
-    UIManager:show(InfoMessage:new{
-        text = _("Eraser selected"),
-        timeout = 0.3,
-    })
+    self:showToolBadge()
     return true
 end
 
@@ -1369,12 +1380,7 @@ function Pencil:setTool(tool)
     self.current_tool = tool
     self:saveSettings()
     self:applySupernotePen()
-    -- Show visual feedback with proper display name
-    local display_name = tool == TOOL_PEN and _("pencil") or _("eraser")
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), display_name),
-        timeout = 0.3,
-    })
+    self:showToolBadge()
 end
 
 function Pencil:isEnabled()
@@ -1764,12 +1770,7 @@ function Pencil:togglePenEraser()
     self.current_tool = new_tool
     self:saveSettings()
     logger.dbg("Pencil: toggled from", old_tool, "to", new_tool)
-
-    -- Show brief visual feedback
-    UIManager:show(InfoMessage:new{
-        text = T(_("Tool: %1"), new_tool),
-        timeout = 0.3,
-    })
+    self:showToolBadge()
 end
 
 -- Handle stylus button and tool events
