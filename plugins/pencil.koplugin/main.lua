@@ -425,6 +425,7 @@ function Pencil:setupStylusCallback()
     self.stylus_callback_registered = true
     self:setupSonyDhw()
     self:setupSupernoteInk()
+    self:setupOnyxScribble()
     logger.info("Pencil: stylus callback registered")
 end
 
@@ -523,6 +524,206 @@ function Pencil:teardownSupernoteInk()
     self.supernote_ink_active = false
     self.supernote_last_tool = nil
     logger.info("Pencil: Supernote ink disabled")
+end
+
+-- Onyx Boox (onyxsdk-pen TouchHelper): like Sony, this is an "app-owns-ink"
+-- device — the SDK paints fountain/pencil ink onto the EPD raw layer at
+-- sub-frame latency while normal refreshes are frozen. Unlike Sony, the pen
+-- is consumed entirely at the raw layer, so the events never reach KOReader's
+-- registerStylusCallback path. The only way we learn about a finished stroke
+-- is to poll the launcher's drain queue (onyxScribblePollStroke), bake the
+-- points into Screen.bb, then toggle the raw layer (onyxScribbleClear) so
+-- KOReader's repaint becomes the source of truth.
+local ONYX_POLL_INTERVAL_S = 0.08  -- 12.5 Hz drain while pencil is active
+
+function Pencil:setupOnyxScribble()
+    if not Device:isAndroid() then return end
+    local ok, android = pcall(require, "android")
+    if not ok or not android then return end
+    if not android.onyxScribbleAvailable or not android.onyxScribbleAvailable() then
+        logger.info("Pencil: Onyx scribble unavailable")
+        return
+    end
+    self.onyx_scribble_active = true
+    self.onyx_last_style = nil
+    self:applyOnyxStyle()
+    android.onyxScribbleEnable()
+    self:scheduleOnyxPoll()
+    logger.info("Pencil: Onyx scribble enabled")
+end
+
+function Pencil:teardownOnyxScribble()
+    if not self.onyx_scribble_active then return end
+    self.onyx_scribble_active = false
+    self:cancelOnyxPoll()
+    local ok, android = pcall(require, "android")
+    if ok and android then
+        if android.onyxScribbleClear then android.onyxScribbleClear() end
+        if android.onyxScribbleDisable then android.onyxScribbleDisable() end
+    end
+    logger.info("Pencil: Onyx scribble disabled")
+end
+
+-- Push the current tool's width + stroke style down to the SDK. Pencil tool
+-- maps to STROKE_STYLE_PENCIL (1, uniform width — matches KOReader's
+-- drawLineSegment); highlighter maps to fountain. Eraser keeps the pen style
+-- (erasing is handled by draining pollErase, not by an SDK eraser shape).
+function Pencil:applyOnyxStyle()
+    if not self.onyx_scribble_active then return end
+    local ok, android = pcall(require, "android")
+    if not ok or not android then return end
+    local pen = self.tool_settings[TOOL_PEN] or {}
+    if android.onyxScribbleSetPenWidth then
+        android.onyxScribbleSetPenWidth(math.max(1, tonumber(pen.width) or 3))
+    end
+    local style = (self.current_tool == TOOL_HIGHLIGHTER) and 0 or 1
+    if style ~= self.onyx_last_style and android.onyxScribbleSetStrokeStyle then
+        android.onyxScribbleSetStrokeStyle(style)
+        self.onyx_last_style = style
+    end
+end
+
+function Pencil:scheduleOnyxPoll()
+    if not self.onyx_scribble_active then return end
+    self:cancelOnyxPoll()
+    local plugin = self
+    local action = function()
+        plugin.onyx_poll_pending = nil
+        if not plugin.onyx_scribble_active then return end
+        plugin:drainOnyxStrokes()
+        plugin:scheduleOnyxPoll()
+    end
+    self.onyx_poll_pending = action
+    UIManager:scheduleIn(ONYX_POLL_INTERVAL_S, action)
+end
+
+function Pencil:cancelOnyxPoll()
+    if self.onyx_poll_pending then
+        UIManager:unschedule(self.onyx_poll_pending)
+        self.onyx_poll_pending = nil
+    end
+end
+
+-- Drain every queued pen + eraser stroke from the launcher and apply it.
+function Pencil:drainOnyxStrokes()
+    local ok, android = pcall(require, "android")
+    if not ok or not android then return end
+    local got = false
+    if android.onyxScribblePollStroke then
+        while true do
+            local s = android.onyxScribblePollStroke()
+            if not s or s == "" then break end
+            self:onOnyxOverlayStroke(s)
+            got = true
+        end
+    end
+    if android.onyxScribblePollErase then
+        while true do
+            local s = android.onyxScribblePollErase()
+            if not s or s == "" then break end
+            self:onOnyxEraseStroke(s)
+            got = true
+        end
+    end
+    if got then
+        self:_markPenActivity()
+        -- Each baked stroke already partial-refreshed its bbox (native render).
+        -- Now drop the SDK raw render briefly so that native render is what
+        -- remains on the EPD, then raw rendering resumes for the next stroke.
+        if android.onyxScribbleResetFreeze then
+            android.onyxScribbleResetFreeze()
+        end
+    end
+end
+
+-- Bake one finished Onyx pen stroke into Screen.bb (the persistent buffer),
+-- mirroring onSonyOverlayStroke. The point string is "x,y;x,y;..." but the
+-- same "(x,y)" gmatch used for Sony parses it regardless of the separator.
+--
+-- NOTE (on-device calibration): coordinates are taken as already-in-screen
+-- space (same assumption as the working Sony path). If strokes land rotated
+-- or mirrored on a rotated Onyx, wrap each (x,y) in self:transformCoordinates.
+function Pencil:onOnyxOverlayStroke(s)
+    local page = self:getCurrentPage()
+    local tool = self.current_tool
+    local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+    local points = {}
+    local minx, miny, maxx, maxy
+    for sx, sy in s:gmatch("(-?%d+),(-?%d+)") do
+        local x, y = tonumber(sx), tonumber(sy)
+        table.insert(points, { x = x, y = y })
+        if not minx or x < minx then minx = x end
+        if not maxx or x > maxx then maxx = x end
+        if not miny or y < miny then miny = y end
+        if not maxy or y > maxy then maxy = y end
+    end
+    if #points == 0 then return end
+    local stroke = {
+        page = page,
+        tool = tool,
+        points = points,
+        width = tool_settings.width,
+        color = tool_settings.color,
+        color_name = tool_settings.color_name,
+        alpha = tool_settings.alpha,
+        datetime = os.time(),
+    }
+    table.insert(self.strokes, stroke)
+    self:indexStroke(#self.strokes, page)
+    table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+    self:assignStrokeToGroup(#self.strokes)
+    self:scheduleDeferredWork()
+
+    local width = tool_settings.width
+    local color = tool_settings.color
+    local half_w = math.floor(width / 2)
+    if #points == 1 then
+        Screen.bb:paintRectRGB32(points[1].x - half_w, points[1].y - half_w,
+                                 width, width, color)
+    else
+        for i = 1, #points - 1 do
+            self:drawLineSegment(Screen.bb,
+                points[i].x, points[i].y,
+                points[i + 1].x, points[i + 1].y,
+                width, color)
+        end
+    end
+    -- Partial-refresh just the stroke's bbox so KOReader's native render of the
+    -- stroke appears on the page immediately (instead of lagging until the next
+    -- full refresh / page change). The SDK's raw render is dropped briefly by
+    -- onyxScribbleResetFreeze (called once per drained batch) so this native
+    -- render is what remains on screen.
+    local pad = width + 4
+    local rx = math.max(0, math.floor((minx or 0) - pad))
+    local ry = math.max(0, math.floor((miny or 0) - pad))
+    local rw = math.min(Screen:getWidth() - rx, ((maxx or 0) - (minx or 0)) + pad * 2)
+    local rh = math.min(Screen:getHeight() - ry, ((maxy or 0) - (miny or 0)) + pad * 2)
+    if rw > 0 and rh > 0 then
+        Screen:refreshFast(rx, ry, rw, rh)
+    end
+    logger.dbg("Pencil: Onyx stroke captured,", #points, "points")
+end
+
+-- Apply one finished Onyx eraser stroke: delete any strokes the eraser path
+-- crossed. Reuses eraseAtPoint, the same primitive the tool-toggle eraser uses.
+function Pencil:onOnyxEraseStroke(s)
+    local page = self:getCurrentPage()
+    local deleted_any = false
+    for sx, sy in s:gmatch("(-?%d+),(-?%d+)") do
+        local x, y = tonumber(sx), tonumber(sy)
+        local deleted = self:eraseAtPoint(x, y, page)
+        if deleted and #deleted > 0 then
+            for _, stroke in ipairs(deleted) do
+                table.insert(self.undo_stack, { type = "delete", strokes = { stroke } })
+            end
+            deleted_any = true
+        end
+    end
+    if deleted_any then
+        self.strokes_dirty = true
+        self.view:paintTo(Screen.bb, 0, 0)
+        self:paintTo(Screen.bb, 0, 0)
+    end
 end
 
 -- Convert KOReader pen width (3..9 logical pixels) to Supernote EMR units.
@@ -670,6 +871,18 @@ function Pencil:handleStylusSlot(input, slot)
     -- Don't capture pen input when a menu or overlay is on top of the reader
     if self:isOverlayActive() then return false end
 
+    -- Onyx: the onyxsdk-pen TouchHelper owns the stylus at the EPD raw layer
+    -- (fast live ink) and the finished stroke is persisted by the poll path
+    -- (drainOnyxStrokes -> onOnyxOverlayStroke). If a pen event still leaks
+    -- into KOReader's input here, consume it WITHOUT the slow per-point Lua
+    -- draw + mid-stroke refreshUI — that refresh is what flips the EPD
+    -- waveform mode and makes the page blink while writing. Pen + eraser both
+    -- go through the SDK on Onyx, so swallow the whole slot.
+    if self.onyx_scribble_active then
+        self:_markPenActivity()
+        return true
+    end
+
     -- Detect eraser end via slot.tool BEFORE key events arrive
     -- This handles the timing issue where stylus callback fires before key events
     if ((self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_HIGHLIGHTER) or (not self.swap_eraser_and_highlighter and slot.tool == TOOL_TYPE_ERASER)) and not self.eraser_button_active then
@@ -764,7 +977,23 @@ function Pencil:handleStylusSlot(input, slot)
             self:writeDebugLog(string.format("ERASER MODE: pen_down=%s slot.id=%d",
                 tostring(self.pen_down), slot.id or -1))
         end
+        -- The pen/eraser toggle can be summoned in eraser mode by holding the
+        -- eraser still. Only the menu-selected (software) eraser qualifies: the
+        -- physical eraser end flips effective_tool via slot.tool while
+        -- current_tool stays PEN, and there it should keep erasing, not toggle.
+        local picker_toggle_enabled = self.experimental_tool_toggle
+            and self.current_tool == TOOL_ERASER
         if slot.id and slot.id >= 0 then
+            -- While the long-press picker is up, route fresh taps to it and
+            -- never erase underneath it.
+            if self.color_picker_showing and self.color_picker_widget then
+                if not self.pen_down then
+                    local tx, ty = self:transformCoordinates(slot.x or 0, slot.y or 0)
+                    self.color_picker_widget:handlePenTap(tx, ty)
+                end
+                return true
+            end
+
             -- Eraser is touching - erase at this position
             local first_touch = false
             if not self.pen_down then
@@ -780,6 +1009,25 @@ function Pencil:handleStylusSlot(input, slot)
             local raw_x = slot.x or self.pen_x
             local raw_y = slot.y or self.pen_y
             local x, y = self:transformCoordinates(raw_x, raw_y)
+
+            -- Hold-still tracking for the toggle picker: arm it on first touch,
+            -- then drop it once the eraser travels beyond tolerance (the user
+            -- is actively erasing a region, not holding still to toggle).
+            if picker_toggle_enabled then
+                if first_touch then
+                    self.color_picker_start_x = x
+                    self.color_picker_start_y = y
+                    self.color_picker_start_time = time.now()
+                    self:scheduleColorPickerCheck()
+                elseif self.color_picker_start_x and self.color_picker_start_y then
+                    local dx = math.abs(x - self.color_picker_start_x)
+                    local dy = math.abs(y - self.color_picker_start_y)
+                    if dx > COLOR_PICKER_TOLERANCE_PIXELS or dy > COLOR_PICKER_TOLERANCE_PIXELS then
+                        self:resetColorPickerTracking()
+                    end
+                end
+            end
+
             -- Erase on first touch OR when position changes
             if first_touch or x ~= self.pen_x or y ~= self.pen_y then
                 local page = self:getCurrentPage()
@@ -808,6 +1056,7 @@ function Pencil:handleStylusSlot(input, slot)
             if self.pen_down and self.erasing then
                 self.pen_down = false
                 self.erasing = false
+                self:cancelColorPickerTimer()
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
                     table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
                     self.strokes_dirty = true  -- persisted on next page change / close
@@ -851,11 +1100,12 @@ function Pencil:handleStylusSlot(input, slot)
             self.pen_y = y
             -- Only track picker state and schedule the 10Hz poll when the
             -- hold-pen-still gesture would actually produce something to
-            -- show. Skipping these when both experimental pickers are off
+            -- show. Skipping these when all experimental pickers are off
             -- avoids an UIManager:scheduleIn closure allocation on every
             -- pen-down — real GC pressure on the A53 during multi-second
             -- strokes.
-            if self.experimental_color_picker or self.experimental_pen_width then
+            if self.experimental_color_picker or self.experimental_pen_width
+                    or self.experimental_tool_toggle then
                 self.color_picker_start_x = x
                 self.color_picker_start_y = y
                 self.color_picker_start_time = time.now()
@@ -915,6 +1165,7 @@ function Pencil:teardownStylusCallback()
 
     self:teardownSonyDhw()
     self:teardownSupernoteInk()
+    self:teardownOnyxScribble()
     self.stylus_callback_registered = false
     self.pen_down = false
     logger.info("Pencil: stylus callback unregistered")
@@ -1335,6 +1586,13 @@ function Pencil:loadSettings()
     self.experimental_pen_width = settings.experimental_pen_width or false
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
+    -- Hold-pen-still opens a pen/eraser toggle in the long-press picker.
+    -- Available in both pen and eraser mode. Default ON.
+    if settings.experimental_tool_toggle == nil then
+        self.experimental_tool_toggle = true
+    else
+        self.experimental_tool_toggle = settings.experimental_tool_toggle
+    end
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1368,6 +1626,7 @@ function Pencil:saveSettings()
         experimental_pen_width = self.experimental_pen_width,
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
+        experimental_tool_toggle = self.experimental_tool_toggle,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         double_tap_toggle_tool = self.double_tap_toggle_tool,
@@ -1375,12 +1634,16 @@ function Pencil:saveSettings()
     })
 end
 
--- Set current tool
-function Pencil:setTool(tool)
+-- Set current tool. Pass silent=true to skip the corner badge (e.g. when the
+-- caller shows its own confirmation, like the long-press picker's toast).
+function Pencil:setTool(tool, silent)
     self.current_tool = tool
     self:saveSettings()
     self:applySupernotePen()
-    self:showToolBadge()
+    self:applyOnyxStyle()
+    if not silent then
+        self:showToolBadge()
+    end
 end
 
 function Pencil:isEnabled()
@@ -1590,6 +1853,28 @@ function Pencil:addToMainMenu(menu_items)
                             else
                                 UIManager:show(InfoMessage:new{
                                     text = _("Pen width picker disabled."),
+                                    timeout = 2,
+                                })
+                            end
+                        end,
+                    },
+                    {
+                        text = _("Pen/eraser toggle"),
+                        help_text = _("Add a pen/eraser toggle to the hold-pen-still picker. The toggle row shows a filled square (pen) and a hollow square (eraser); tap to switch tools. Available in both pen and eraser mode \xe2\x80\x94 hold the stylus still on a blank spot to summon it."),
+                        checked_func = function()
+                            return self.experimental_tool_toggle
+                        end,
+                        callback = function()
+                            self.experimental_tool_toggle = not self.experimental_tool_toggle
+                            self:saveSettings()
+                            if self.experimental_tool_toggle then
+                                UIManager:show(InfoMessage:new{
+                                    text = _("Pen/eraser toggle enabled. Hold the stylus still to open the picker and switch tools."),
+                                    timeout = 3,
+                                })
+                            else
+                                UIManager:show(InfoMessage:new{
+                                    text = _("Pen/eraser toggle disabled."),
                                     timeout = 2,
                                 })
                             end
@@ -2159,6 +2444,9 @@ function Pencil:scheduleDelayedRefresh()
                 SupernoteInk.clearAll()
             end)
         end
+        -- Onyx commits each stroke inline (per-stroke partial refresh +
+        -- onyxScribbleResetFreeze in drainOnyxStrokes), so there's nothing to
+        -- do on the delayed-refresh timer here.
     end
     self.pending_refresh = action
     UIManager:scheduleIn(self.refresh_delay_ms / 1000, action)
@@ -2222,10 +2510,11 @@ end
 
 -- Check if color picker should be shown (called periodically while pen is down)
 function Pencil:checkColorPickerTrigger()
-    -- Gated behind the two experimental flags. At least one must be on for
-    -- the hold-pen-still gesture to produce anything; otherwise the pen
-    -- stays on its last-saved color/width.
-    if not (self.experimental_color_picker or self.experimental_pen_width) then return end
+    -- Gated behind the experimental flags. At least one must be on for the
+    -- hold-pen-still gesture to produce anything; otherwise the pen stays on
+    -- its last-saved color/width and no picker opens.
+    if not (self.experimental_color_picker or self.experimental_pen_width
+            or self.experimental_tool_toggle) then return end
     if not self.color_picker_start_time then return end
     if self.color_picker_showing then return end
 
@@ -2280,8 +2569,10 @@ local ColorPickerWidget = InputContainer:extend {
     height = nil,
     colors = nil, -- Array of {color, name} objects
     widths = nil, -- Optional array of {name, width} objects (experimental width picker)
+    tools = nil, -- Optional array of {kind="tool", tool_value=...} (pen/eraser toggle)
     current_color_name = nil, -- Currently selected color name (for comparison)
     current_width = nil, -- Currently selected pen width (for width selection indicator)
+    current_tool = nil, -- Currently selected tool (for toggle selection indicator)
     callback = nil,
     close_callback = nil,
     -- Layout constants cached after init so handlePenTap / paintTo don't
@@ -2296,17 +2587,65 @@ local ColorPickerWidget = InputContainer:extend {
 -- also stores its own color / width metadata so the callback can route without
 -- string-matching on name.
 function ColorPickerWidget:_makeButton(item, button_size, selection_border)
-    -- Selection: colors compare by name, widths compare by width value
+    -- Selection: colors compare by name, widths by width value, tools by tool.
     local is_selected
     if item.kind == "width" then
         is_selected = (item.width_value == self.current_width)
+    elseif item.kind == "tool" then
+        is_selected = (item.tool_value == self.current_tool)
     else
         is_selected = (item.name == self.current_color_name)
     end
     local border_size = is_selected and selection_border or Size.border.thick
 
     local swatch
-    if item.kind == "width" then
+    if item.kind == "tool" then
+        -- Pen/eraser glyph, matching showToolBadge: a filled black square
+        -- means pen, a hollow square means eraser. Rendered as a centered
+        -- icon on a white button so it reads as a tool, not a color swatch.
+        local inner = button_size - border_size * 2
+        local icon_size = math.floor(inner * 0.55)
+        -- FrameContainer:getSize() = content + bordersize*2, so subtract the
+        -- border from the hollow square's content to keep both glyphs the same
+        -- icon_size outer square (pen filled, eraser hollow).
+        local icon
+        if item.tool_value == TOOL_ERASER then
+            local hollow_inner = math.max(1, icon_size - Size.border.thick * 2)
+            icon = FrameContainer:new{
+                padding = 0,
+                margin = 0,
+                bordersize = Size.border.thick,
+                color = Blitbuffer.COLOR_BLACK,
+                background = Blitbuffer.COLOR_WHITE,
+                WidgetContainer:new{
+                    dimen = Geom:new{ w = hollow_inner, h = hollow_inner },
+                },
+            }
+        else
+            icon = FrameContainer:new{
+                padding = 0,
+                margin = 0,
+                bordersize = 0,
+                background = Blitbuffer.COLOR_BLACK,
+                WidgetContainer:new{
+                    dimen = Geom:new{ w = icon_size, h = icon_size },
+                },
+            }
+        end
+        swatch = FrameContainer:new{
+            width = button_size,
+            height = button_size,
+            padding = 0,
+            margin = 0,
+            bordersize = border_size,
+            color = Blitbuffer.COLOR_BLACK,
+            background = Blitbuffer.COLOR_WHITE,
+            CenterContainer:new{
+                dimen = Geom:new{ w = inner, h = inner },
+                icon,
+            },
+        }
+    elseif item.kind == "width" then
         -- Truthful preview: a horizontal black bar whose height equals the
         -- stroke's actual device-pixel thickness. We deliberately do NOT
         -- scale by Screen:scaleBySize — the stroke itself is drawn in raw
@@ -2366,9 +2705,10 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
         dimen = Geom:new{ w = button_size, h = button_size },
         swatch,
         kind = item.kind,
-        color_value = item.color_value,  -- nil for width items
+        color_value = item.color_value,  -- nil for width/tool items
         color_name = item.name,
-        width_value = item.width_value,  -- nil for color items
+        width_value = item.width_value,  -- nil for color/tool items
+        tool_value = item.tool_value,    -- nil for color/width items
     }
 
     button.ges_events = {
@@ -2383,7 +2723,7 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
     local widget = self
     button.onTapSelectColor = function(btn)
         if widget.callback then
-            widget.callback(btn.color_value, btn.color_name, btn.width_value)
+            widget.callback(btn.color_value, btn.color_name, btn.width_value, btn.tool_value)
         end
         if widget.close_callback then
             widget.close_callback()
@@ -2458,39 +2798,48 @@ function ColorPickerWidget:init()
         widths_row_width = #width_items * button_size + (#width_items - 1) * spacing
     end
 
-    -- Inner width accommodates the wider of the visible rows. Height
-    -- accumulates one button_size per visible row plus a gap when both
-    -- are showing.
-    local visible_rows = (has_colors and 1 or 0) + (has_widths and 1 or 0)
-    local inner_w = math.max(colors_row_width, widths_row_width)
+    -- Build optional pen/eraser toggle row. `tools` is already a list of
+    -- {kind="tool", tool_value=...} items.
+    local has_tools = self.tools and #self.tools > 0
+    self.tool_buttons_info = {}
+    local tool_row_group
+    local tools_row_width = 0
+    if has_tools then
+        tool_row_group = self:_buildRow(self.tools, button_size, spacing, selection_border, self.tool_buttons_info)
+        tools_row_width = #self.tools * button_size + (#self.tools - 1) * spacing
+    end
+
+    -- Assemble the visible rows in display order (colors, widths, tools).
+    -- Inner width accommodates the widest visible row; height accumulates one
+    -- button_size per row plus a gap between each adjacent pair.
+    local row_groups = {}
+    if has_colors then table.insert(row_groups, color_row_group) end
+    if has_widths then table.insert(row_groups, width_row_group) end
+    if has_tools then table.insert(row_groups, tool_row_group) end
+
+    local visible_rows = #row_groups
+    local inner_w = math.max(colors_row_width, widths_row_width, tools_row_width)
     self.width = inner_w
-    self.height = visible_rows * button_size + (visible_rows > 1 and row_gap or 0)
+    self.height = visible_rows * button_size
+        + (visible_rows > 1 and (visible_rows - 1) * row_gap or 0)
 
     local content
-    if has_colors and has_widths then
-        content = VerticalGroup:new{
-            align = "center",
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner_w, h = button_size },
-                color_row_group,
-            },
-            VerticalSpan:new{ width = row_gap },
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner_w, h = button_size },
-                width_row_group,
-            },
-        }
-    elseif has_colors then
+    if visible_rows == 1 then
         content = CenterContainer:new{
             dimen = Geom:new{ w = inner_w, h = button_size },
-            color_row_group,
+            row_groups[1],
         }
     else
-        -- widths-only picker (color picker experimental flag off)
-        content = CenterContainer:new{
-            dimen = Geom:new{ w = inner_w, h = button_size },
-            width_row_group,
-        }
+        content = VerticalGroup:new{ align = "center" }
+        for i, group in ipairs(row_groups) do
+            if i > 1 then
+                table.insert(content, VerticalSpan:new{ width = row_gap })
+            end
+            table.insert(content, CenterContainer:new{
+                dimen = Geom:new{ w = inner_w, h = button_size },
+                group,
+            })
+        end
     end
 
     self.frame = FrameContainer:new{
@@ -2539,6 +2888,20 @@ function ColorPickerWidget:_hitRow(x, y, row_y, info_list)
     return info_list[idx]
 end
 
+-- The button info-lists for the visible rows, in top-to-bottom display order
+-- (colors, widths, tools). Empty rows are omitted so they don't consume a
+-- vertical slot — both hit-testing and painting walk this same list, keeping
+-- them in lockstep regardless of which experimental flags are on.
+function ColorPickerWidget:_orderedRows()
+    local rows = {}
+    if #self.color_buttons_info > 0 then table.insert(rows, self.color_buttons_info) end
+    if #self.width_buttons_info > 0 then table.insert(rows, self.width_buttons_info) end
+    if self.tool_buttons_info and #self.tool_buttons_info > 0 then
+        table.insert(rows, self.tool_buttons_info)
+    end
+    return rows
+end
+
 -- Handle pen/stylus tap on color picker
 -- Returns true if the tap was handled (hit a button or was inside picker)
 function ColorPickerWidget:handlePenTap(x, y)
@@ -2563,19 +2926,19 @@ function ColorPickerWidget:handlePenTap(x, y)
     local row_gap = self._row_gap
     local padding = self._padding
 
-    -- When colors are hidden (color-picker flag off, width-picker on),
-    -- the widths row slides up to the top-row position. The info-lists
-    -- drive which row is where.
+    -- Hidden rows are omitted, so each present row slides up to fill the gap.
+    -- Walk the ordered rows and stack them top-to-bottom.
     local top_row_y = self.dimen.y + border + padding
-    local colors_present = #self.color_buttons_info > 0
-    local widths_row_y = colors_present and (top_row_y + button_size + row_gap) or top_row_y
-
-    local btn = self:_hitRow(x, y, top_row_y, self.color_buttons_info)
-        or self:_hitRow(x, y, widths_row_y, self.width_buttons_info)
+    local btn
+    for i, info_list in ipairs(self:_orderedRows()) do
+        local row_y = top_row_y + (i - 1) * (button_size + row_gap)
+        btn = self:_hitRow(x, y, row_y, info_list)
+        if btn then break end
+    end
 
     if btn then
         if self.callback then
-            self.callback(btn.color_value, btn.color_name, btn.width_value)
+            self.callback(btn.color_value, btn.color_name, btn.width_value, btn.tool_value)
         end
         if self.close_callback then
             self.close_callback()
@@ -2636,18 +2999,12 @@ function ColorPickerWidget:paintTo(bb, x, y)
     local border = Size.border.window
     local frame_inner_width = self.dimen.w - 2 * padding - 2 * border
 
-    -- Symmetric with handlePenTap: widths slide up to the top slot when
-    -- no colors are visible.
+    -- Symmetric with handlePenTap: stack the present rows top-to-bottom,
+    -- placing each row's button dimens so their tap ranges match the paint.
     local top_row_y = paint_y + border + padding
-    local colors_present = #self.color_buttons_info > 0
-
-    if colors_present then
-        self:_placeRow(self.color_buttons_info, paint_x, frame_inner_width, padding, border, top_row_y)
-    end
-
-    if self.width_buttons_info and #self.width_buttons_info > 0 then
-        local widths_row_y = colors_present and (top_row_y + button_size + row_gap) or top_row_y
-        self:_placeRow(self.width_buttons_info, paint_x, frame_inner_width, padding, border, widths_row_y)
+    for i, info_list in ipairs(self:_orderedRows()) do
+        local row_y = top_row_y + (i - 1) * (button_size + row_gap)
+        self:_placeRow(info_list, paint_x, frame_inner_width, padding, border, row_y)
     end
 end
 
@@ -2669,22 +3026,44 @@ function Pencil:showColorPicker(x, y)
         Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
     end
 
+    -- The pen that summoned the picker is still physically down, but its lift
+    -- event is swallowed while the picker overlay is up (handleStylusSlot
+    -- early-returns on isOverlayActive). Clear the logical contact now so a
+    -- stuck pen_down/erasing doesn't eat the next stroke once the picker
+    -- closes. If a hold-still in eraser mode already deleted something, commit
+    -- it to the undo stack first, mirroring the normal eraser-lift path.
+    if self.erasing and self.eraser_deleted and #self.eraser_deleted > 0 then
+        table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
+        self.strokes_dirty = true
+    end
+    self.eraser_deleted = nil
+    self.pen_down = false
+    self.erasing = false
+
     self.color_picker_showing = true
 
     local plugin = self
 
-    -- Which rows to render is driven by the two experimental toggles,
-    -- independently. The hold-pen-still gesture only gets here when at
-    -- least one of them is on (see checkColorPickerTrigger), so at least
-    -- one row is guaranteed non-empty.
-    local show_colors = self.experimental_color_picker
-    local show_widths = self.experimental_pen_width
+    -- Which rows to render is driven by the experimental toggles, each
+    -- independent. Color and width are pen properties, so they are hidden
+    -- in eraser mode; the pen/eraser toggle shows in both modes. The
+    -- hold-pen-still gesture only gets here when at least one applicable
+    -- flag is on (see checkColorPickerTrigger / the eraser path), so at
+    -- least one row is guaranteed non-empty.
+    local in_eraser_mode = (self.current_tool == TOOL_ERASER)
+    local show_colors = self.experimental_color_picker and not in_eraser_mode
+    local show_widths = self.experimental_pen_width and not in_eraser_mode
+    local show_tools = self.experimental_tool_toggle
     local colors_for_picker = show_colors and self.available_colors or nil
     local widths_for_picker = show_widths and self.available_widths or nil
+    local tools_for_picker = show_tools and {
+        { kind = "tool", tool_value = TOOL_PEN },
+        { kind = "tool", tool_value = TOOL_ERASER },
+    } or nil
 
-    -- Picker uses up to two rows (colors on top, widths below). Row width
-    -- is the wider of the two visible rows; height accumulates one
-    -- button_size per visible row plus a gap between them.
+    -- Picker stacks up to three rows (colors, widths, tools). Row width is
+    -- the widest visible row; height accumulates one button_size per visible
+    -- row plus a gap between each adjacent pair.
     local button_size = Screen:scaleBySize(36)
     local spacing = Screen:scaleBySize(8)
     local row_gap = Screen:scaleBySize(8)
@@ -2694,12 +3073,15 @@ function Pencil:showColorPicker(x, y)
         (#self.available_colors * button_size + (#self.available_colors - 1) * spacing) or 0
     local widths_row_width = show_widths and
         (#self.available_widths * button_size + (#self.available_widths - 1) * spacing) or 0
-    local buttons_width = math.max(colors_row_width, widths_row_width)
+    local n_tools = tools_for_picker and #tools_for_picker or 0
+    local tools_row_width = (n_tools > 0) and
+        (n_tools * button_size + (n_tools - 1) * spacing) or 0
+    local buttons_width = math.max(colors_row_width, widths_row_width, tools_row_width)
     local picker_width = buttons_width + padding * 2 + border * 2
-    local rows = (show_colors and 1 or 0) + (show_widths and 1 or 0)
+    local rows = (show_colors and 1 or 0) + (show_widths and 1 or 0) + (show_tools and 1 or 0)
     local picker_height = rows * button_size + padding * 2 + border * 2
     if rows > 1 then
-        picker_height = picker_height + row_gap
+        picker_height = picker_height + (rows - 1) * row_gap
     end
     local margin_above = Screen:scaleBySize(30)  -- Gap between picker and pen
     local screen_margin = 10  -- Minimum margin from screen edges
@@ -2729,11 +3111,24 @@ function Pencil:showColorPicker(x, y)
     local color_picker = ColorPickerWidget:new{
         colors = colors_for_picker,
         widths = widths_for_picker,
+        tools = tools_for_picker,
         current_color_name = self.tool_settings[TOOL_PEN].color_name,
         current_width = self.tool_settings[TOOL_PEN].width,
-        callback = function(color_value, color_name, width_value)
-            -- Width taps are routed through width_value; color taps leave it nil.
-            -- This avoids the string-match ambiguity the earlier prototype had.
+        current_tool = self.current_tool,
+        callback = function(color_value, color_name, width_value, tool_value)
+            -- Taps are routed by which value is non-nil: tool toggle, then
+            -- width, then color. This avoids the string-match ambiguity the
+            -- earlier prototype had.
+            if tool_value then
+                -- Switch silently first: a badge painted now would be wiped by
+                -- the picker's close repaint. Re-paint the top-right corner
+                -- indicator just after that repaint settles, so the tool switch
+                -- shows the same badge as the double-tap/gesture toggle (no toast).
+                plugin:setTool(tool_value, true)
+                UIManager:scheduleIn(0.2, function() plugin:showToolBadge() end)
+                return
+            end
+
             if width_value then
                 plugin:setPenWidth(width_value)
                 UIManager:show(InfoMessage:new{
@@ -2804,6 +3199,8 @@ function Pencil:setPenWidth(width)
     -- "tool unchanged" short-circuit.
     self.supernote_last_tool = nil
     self:applySupernotePen()
+    -- Keep the Onyx SDK stroke width in sync too.
+    self:applyOnyxStyle()
 end
 
 -- Handle initial touch - fires IMMEDIATELY on first contact
