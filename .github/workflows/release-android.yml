@@ -1,12 +1,14 @@
 name: Release Android APK
 
 # Build a signed Android APK and publish it as a GitHub Release whenever a
-# `sony-dpt-v*` tag is pushed. Can also be triggered manually from the
-# Actions tab to produce a draft release for any commit.
+# `sony-dpt-v*` (android-arm) or `supernote-v*` (android-arm64) tag is
+# pushed. Can also be triggered manually from the Actions tab to produce a
+# draft release for any commit.
 on:
   push:
     tags:
       - 'sony-dpt-v*'
+      - 'supernote-v*'
   workflow_dispatch:
     inputs:
       target:
@@ -34,7 +36,7 @@ jobs:
 
     env:
       KOANDROID_IMAGE: koreader/koandroid:0.9.7-22.04
-      TARGET: ${{ github.event.inputs.target || 'android-arm' }}
+      TARGET: ${{ github.event.inputs.target || (startsWith(github.ref_name, 'supernote-') && 'android-arm64') || 'android-arm' }}
 
     steps:
       - name: Checkout (with submodules)
