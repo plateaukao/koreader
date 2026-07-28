@@ -41,7 +41,10 @@ local TOOL_HIGHLIGHTER = "highlighter"
 local TOOL_ERASER = "eraser"
 
 -- Color picker trigger settings
-local COLOR_PICKER_DELAY_MS = 500  -- How long pen must be held still (milliseconds)
+local COLOR_PICKER_DELAY_MS = 300  -- Default hold-still time (ms); overridable via
+                                   -- the "Long-press hold time" setting (color_picker_delay_ms)
+local COLOR_PICKER_DELAY_MIN_MS = 150
+local COLOR_PICKER_DELAY_MAX_MS = 1500
 local COLOR_PICKER_TOLERANCE_PIXELS = 15  -- How many pixels pen can move while "still"
 
 -- Annotation grouping constants
@@ -423,9 +426,14 @@ function Pencil:setupStylusCallback()
     end)
 
     self.stylus_callback_registered = true
+    self.stylus_coords_logical = self:detectLogicalStylusCoords()
+    if self.stylus_coords_logical then
+        logger.info("Pencil: stylus coords are logical (Android MotionEvent); skipping rotation transform")
+    end
     self:setupSonyDhw()
     self:setupSupernoteInk()
     self:setupOnyxScribble()
+    self:setupHuaweiAhw()
     logger.info("Pencil: stylus callback registered")
 end
 
@@ -601,6 +609,228 @@ function Pencil:cancelOnyxPoll()
     if self.onyx_poll_pending then
         UIManager:unschedule(self.onyx_poll_pending)
         self.onyx_poll_pending = nil
+    end
+end
+
+-- Huawei MatePad Paper (Kirin e-ink): the firmware paints stylus ink to an
+-- HWSurfaceView overlay via Auto-HandWrite (android.eink.*), reporting the
+-- captured pen points back through IAhwTouchListener. Like Onyx, the firmware
+-- owns the live ink and KOReader drains finished strokes (drainHuaweiStrokes
+-- -> onOnyxOverlayStroke, reused as-is) to bake them into Screen.bb for
+-- persistence, then clears the overlay so the firmware ink doesn't double-
+-- print on top of the persistent stroke. The eraser is NOT auto-captured, so
+-- it falls through to KOReader's normal erase handling.
+function Pencil:setupHuaweiAhw()
+    if not Device:isAndroid() then return end
+    local ok, android = pcall(require, "android")
+    if not ok or not android then return end
+    if not android.huaweiAhwAvailable or not android.huaweiAhwAvailable() then
+        logger.info("Pencil: Huawei AHW unavailable")
+        return
+    end
+    local pen = self.tool_settings[TOOL_PEN] or {}
+    local pen_width = math.max(1, tonumber(pen.width) or 4)
+    if android.huaweiAhwSetPen then
+        -- color 0 => firmware black (the panel is grayscale; the persistent
+        -- stroke baked into Screen.bb keeps KOReader's real color).
+        android.huaweiAhwSetPen(pen_width, 0)
+    end
+    self.huawei_ahw_active = true
+    -- enable() can fail if the overlay's FB surface isn't created yet; the poll
+    -- loop retries until it sticks (huawei_ahw_enabled).
+    self.huawei_ahw_enabled = (android.huaweiAhwEnable and android.huaweiAhwEnable()) or false
+    self:scheduleHuaweiPoll()
+    logger.info("Pencil: Huawei AHW setup, pen=", pen_width,
+                "enabled=", tostring(self.huawei_ahw_enabled))
+end
+
+function Pencil:teardownHuaweiAhw()
+    if not self.huawei_ahw_active then return end
+    self:cancelHuaweiPoll()
+    local ok, android = pcall(require, "android")
+    if ok and android then
+        if android.huaweiAhwDisable then android.huaweiAhwDisable() end
+        if android.huaweiAhwClear then android.huaweiAhwClear() end
+    end
+    self.huawei_ahw_active = false
+    self.huawei_ahw_enabled = false
+    self.huawei_pen_down = false
+    self.huawei_picker_dropped = false
+    self.huawei_last_pen_width = nil
+    logger.info("Pencil: Huawei AHW disabled")
+end
+
+function Pencil:scheduleHuaweiPoll()
+    if not self.huawei_ahw_active then return end
+    self:cancelHuaweiPoll()
+    local plugin = self
+    local action = function()
+        plugin.huawei_poll_pending = nil
+        if not plugin.huawei_ahw_active then return end
+        local ok, android = pcall(require, "android")
+        if ok and android then
+            plugin:pollHuaweiHoldGesture(android)  -- hold-still -> open picker
+            plugin:reconcileHuaweiAhw(android)     -- AHW on/off by tool + picker
+        end
+        plugin:drainHuaweiStrokes()
+        plugin:scheduleHuaweiPoll()
+    end
+    self.huawei_poll_pending = action
+    UIManager:scheduleIn(ONYX_POLL_INTERVAL_S, action)
+end
+
+function Pencil:cancelHuaweiPoll()
+    if self.huawei_poll_pending then
+        UIManager:unschedule(self.huawei_poll_pending)
+        self.huawei_poll_pending = nil
+    end
+end
+
+-- Drain every finished pen stroke the firmware captured and bake it.
+function Pencil:drainHuaweiStrokes()
+    local ok, android = pcall(require, "android")
+    if not ok or not android then return end
+    local got = false
+    if android.huaweiAhwPollStroke then
+        while true do
+            local s = android.huaweiAhwPollStroke()
+            if not s or s == "" then break end
+            self:onHuaweiOverlayStroke(s)
+            got = true
+        end
+    end
+    if got then
+        self:_markPenActivity()
+        -- The firmware shows the live ink; defer a single clean reconciliation
+        -- (page refresh + overlay clear, in scheduleDelayedRefresh) instead of a
+        -- partial refresh per stroke, which would ghost rectangular blocks.
+        self:scheduleDelayedRefresh()
+    end
+end
+
+-- Bake one firmware-captured pen stroke into Screen.bb + the model WITHOUT a
+-- per-stroke refresh. On the MatePad the firmware already displays the ink
+-- live, so KOReader only persists the stroke; the screen is reconciled once on
+-- the delayed timer (see scheduleDelayedRefresh's huawei branch). This avoids
+-- the per-stroke partial-refresh ghosting blocks.
+function Pencil:onHuaweiOverlayStroke(s)
+    -- AHW is off in eraser mode, so polled strokes are always pen strokes;
+    -- guard against the brief race right after a tool switch.
+    if self.current_tool == TOOL_ERASER then return end
+    local page = self:getCurrentPage()
+    local tool = self.current_tool
+    local tool_settings = self.tool_settings[tool] or self.tool_settings[TOOL_PEN]
+    local points = {}
+    for sx, sy in s:gmatch("(-?%d+),(-?%d+)") do
+        table.insert(points, { x = tonumber(sx), y = tonumber(sy) })
+    end
+    if #points == 0 then return end
+    local stroke = {
+        page = page,
+        tool = tool,
+        points = points,
+        width = tool_settings.width,
+        color = tool_settings.color,
+        color_name = tool_settings.color_name,
+        alpha = tool_settings.alpha,
+        datetime = os.time(),
+    }
+    table.insert(self.strokes, stroke)
+    self:indexStroke(#self.strokes, page)
+    table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+    self:assignStrokeToGroup(#self.strokes)
+    self:scheduleDeferredWork()
+
+    local width = tool_settings.width
+    local color = tool_settings.color
+    local half_w = math.floor(width / 2)
+    if #points == 1 then
+        Screen.bb:paintRectRGB32(points[1].x - half_w, points[1].y - half_w,
+                                 width, width, color)
+    else
+        for i = 1, #points - 1 do
+            self:drawLineSegment(Screen.bb,
+                points[i].x, points[i].y,
+                points[i + 1].x, points[i + 1].y,
+                width, color)
+        end
+    end
+    -- No refresh here on purpose (see function comment).
+end
+
+-- Re-create the hold-to-picker gesture from the firmware pen stream. The
+-- firmware consumes the stylus, so KOReader's normal detection in
+-- handleStylusSlot never fires; instead we poll the AHW pen state each tick and
+-- drive the SAME color_picker tracking + checkColorPickerTrigger. Once the pen
+-- has been held still (within tolerance) past COLOR_PICKER_DELAY_MS the picker
+-- opens; we then pause AHW so the selection taps reach KOReader's gesture
+-- system (handleStylusSlot early-returns while an overlay is up), and drop the
+-- hold's ink dot. AHW resumes when the picker closes.
+function Pencil:pollHuaweiHoldGesture(android)
+    -- Only meaningful when a hold-triggered picker is actually configured.
+    if not (self.experimental_color_picker or self.experimental_pen_width
+            or self.experimental_tool_toggle) then return end
+    if not android.huaweiAhwPollPenState then return end
+    local st = android.huaweiAhwPollPenState()
+    if st and st:sub(1, 4) == "down" then
+        local sx, sy, sdisp = st:match("down,(-?%d+),(-?%d+),(%d+)")
+        if sx then
+            local x, y, disp = tonumber(sx), tonumber(sy), tonumber(sdisp)
+            self.pen_x = x
+            self.pen_y = y
+            if not self.huawei_pen_down then
+                self.huawei_pen_down = true
+                self.color_picker_start_x = x
+                self.color_picker_start_y = y
+                self.color_picker_start_time = time.now()
+            elseif disp > COLOR_PICKER_TOLERANCE_PIXELS then
+                -- Travelled too far: this is a real stroke, not a hold.
+                self:resetColorPickerTracking()
+            end
+            self:checkColorPickerTrigger()
+        end
+    elseif self.huawei_pen_down then
+        self.huawei_pen_down = false
+        self:resetColorPickerTracking()
+    end
+    -- When the picker opens, discard the hold's ink dot once (the firmware
+    -- painted it during the hold). reconcileHuaweiAhw pauses capture so the
+    -- selection taps reach KOReader, and resumes it when the picker closes.
+    if self.color_picker_showing then
+        if not self.huawei_picker_dropped then
+            self.huawei_picker_dropped = true
+            if android.huaweiAhwDropCurrentStroke then android.huaweiAhwDropCurrentStroke() end
+        end
+    else
+        self.huawei_picker_dropped = false
+    end
+end
+
+-- Keep firmware Auto-HandWrite enabled only when it should be inking: OFF in
+-- eraser mode (so the pen tip reaches KOReader's erase path instead of being
+-- painted as ink), and OFF while the picker is up (so selection taps reach
+-- KOReader's gesture system). Also pushes the current pen width to the firmware
+-- preview. Runs every poll tick, so tool/picker changes reconcile within ~80ms.
+function Pencil:reconcileHuaweiAhw(android)
+    if not self.huawei_ahw_active then return end
+    local is_eraser = self.eraser_button_active or self.eraser_tool_active
+                      or self.current_tool == TOOL_ERASER
+    local want_ink = not self.color_picker_showing and not is_eraser
+    if want_ink then
+        if not self.huawei_ahw_enabled and android.huaweiAhwEnable then
+            self.huawei_ahw_enabled = android.huaweiAhwEnable()
+        end
+        if self.huawei_ahw_enabled and android.huaweiAhwSetPen then
+            local pen = self.tool_settings[TOOL_PEN] or {}
+            local w = math.max(1, tonumber(pen.width) or 4)
+            if w ~= self.huawei_last_pen_width then
+                android.huaweiAhwSetPen(w, 0)
+                self.huawei_last_pen_width = w
+            end
+        end
+    elseif self.huawei_ahw_enabled then
+        if android.huaweiAhwDisable then android.huaweiAhwDisable() end
+        self.huawei_ahw_enabled = false
     end
 end
 
@@ -844,9 +1074,32 @@ function Pencil:onSonyOverlayStroke(s)
                "points  refresh=", rx, ry, rw, rh)
 end
 
--- Transform stylus coordinates based on screen rotation
--- Raw stylus coordinates are in hardware space; framebuffer expects logical (rotated) space
+-- True on devices whose stylus arrives via the Android MotionEvent pipeline,
+-- where coordinates are already in logical (display-rotated) screen space.
+-- HyRead M08P (RK3576) is such a device, and its panel's natural orientation
+-- is ROTATION_180, so re-rotating the pen here (identity at rotation 0) flips
+-- it 180°. Detected once; see transformCoordinates.
+function Pencil:detectLogicalStylusCoords()
+    -- KOReader's Android port delivers stylus events through Android
+    -- MotionEvent, whose coordinates are already in logical (display-rotated)
+    -- screen space — the same space the renderer and finger-touch path use.
+    -- Raw-evdev platforms (Kobo/Linux) report native panel coords and DO need
+    -- the rotation transform; Onyx's SDK pen path reports native coords too but
+    -- is baked in onOnyxOverlayStroke, which never calls transformCoordinates.
+    return Device:isAndroid()
+end
+
+-- Transform stylus coordinates based on screen rotation.
+-- Raw evdev stylus coordinates (Kobo/Linux, and Onyx's SDK pen path) are in
+-- the panel's native hardware space and must be rotated into logical/display
+-- space. But on devices that deliver the pen through Android MotionEvent the
+-- coordinates are ALREADY logical — the same space the finger-touch path and
+-- the renderer use — so rotating again double-rotates the pen. Skip the
+-- transform for those (see detectLogicalStylusCoords).
 function Pencil:transformCoordinates(x, y)
+    if self.stylus_coords_logical then
+        return x, y
+    end
     local rotation = Screen:getRotationMode()
     return PencilGeometry.transformForRotation(x, y, rotation, Screen:getWidth(), Screen:getHeight())
 end
@@ -901,6 +1154,19 @@ function Pencil:handleStylusSlot(input, slot)
         self.eraser_button_deleted = nil
         self:applySupernotePen()
         UIManager:setDirty(self.view, "ui")
+    end
+
+    -- Huawei MatePad Paper: when the firmware Auto-HandWrite is actively inking
+    -- (huawei_ahw_enabled), pen strokes are captured by the firmware and baked
+    -- from the poll path (drainHuaweiStrokes); swallow any leaked pen event here
+    -- so the stroke isn't recorded twice. In eraser mode AHW is turned OFF
+    -- (reconcileHuaweiAhw), so huawei_ahw_enabled is false and we fall through
+    -- to the normal erase handling below — the pen tip then erases.
+    if self.huawei_ahw_active and self.huawei_ahw_enabled
+            and not (self.eraser_button_active or self.eraser_tool_active
+                     or self.current_tool == TOOL_ERASER) then
+        self:_markPenActivity()
+        return true
     end
 
     -- Eraser mode (from eraser end or hardware button) - works even if pencil disabled
@@ -1166,6 +1432,7 @@ function Pencil:teardownStylusCallback()
     self:teardownSonyDhw()
     self:teardownSupernoteInk()
     self:teardownOnyxScribble()
+    self:teardownHuaweiAhw()
     self.stylus_callback_registered = false
     self.pen_down = false
     logger.info("Pencil: stylus callback unregistered")
@@ -1593,6 +1860,13 @@ function Pencil:loadSettings()
     else
         self.experimental_tool_toggle = settings.experimental_tool_toggle
     end
+    -- How long the pen must be held still to open the long-press picker (ms).
+    self.color_picker_delay_ms = tonumber(settings.color_picker_delay_ms) or COLOR_PICKER_DELAY_MS
+    if self.color_picker_delay_ms < COLOR_PICKER_DELAY_MIN_MS then
+        self.color_picker_delay_ms = COLOR_PICKER_DELAY_MIN_MS
+    elseif self.color_picker_delay_ms > COLOR_PICKER_DELAY_MAX_MS then
+        self.color_picker_delay_ms = COLOR_PICKER_DELAY_MAX_MS
+    end
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1627,6 +1901,7 @@ function Pencil:saveSettings()
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
         experimental_tool_toggle = self.experimental_tool_toggle,
+        color_picker_delay_ms = self.color_picker_delay_ms,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         double_tap_toggle_tool = self.double_tap_toggle_tool,
@@ -1878,6 +2153,33 @@ function Pencil:addToMainMenu(menu_items)
                                     timeout = 2,
                                 })
                             end
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return T(_("Long-press hold time: %1 ms"),
+                                     self.color_picker_delay_ms or COLOR_PICKER_DELAY_MS)
+                        end,
+                        help_text = _("How long to hold the stylus still on a blank spot before the long-press picker (pen/eraser toggle, width, color) opens. Shorter is quicker to trigger but more likely to fire on an accidental pause. A real stroke never triggers it (moving cancels the hold)."),
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            local SpinWidget = require("ui/widget/spinwidget")
+                            UIManager:show(SpinWidget:new{
+                                title_text = _("Long-press hold time"),
+                                info_text = _("Milliseconds to hold the stylus still before the picker opens."),
+                                value = self.color_picker_delay_ms or COLOR_PICKER_DELAY_MS,
+                                value_min = COLOR_PICKER_DELAY_MIN_MS,
+                                value_max = COLOR_PICKER_DELAY_MAX_MS,
+                                value_step = 50,
+                                value_hold_step = 100,
+                                unit = _("ms"),
+                                ok_text = _("Set"),
+                                callback = function(spin)
+                                    self.color_picker_delay_ms = spin.value
+                                    self:saveSettings()
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            })
                         end,
                     },
                     {
@@ -2444,6 +2746,18 @@ function Pencil:scheduleDelayedRefresh()
                 SupernoteInk.clearAll()
             end)
         end
+        -- Huawei: same idea as Supernote. The firmware showed the live ink on
+        -- its overlay during drawing; now that KOReader has baked the strokes
+        -- into Screen.bb and the setDirty above repaints the page with them,
+        -- wipe the firmware overlay so it stops double-printing.
+        if self.huawei_ahw_active then
+            UIManager:scheduleIn(0.3, function()
+                local ok, android = pcall(require, "android")
+                if ok and android and android.huaweiAhwClear then
+                    android.huaweiAhwClear()
+                end
+            end)
+        end
         -- Onyx commits each stroke inline (per-stroke partial refresh +
         -- onyxScribbleResetFreeze in drainOnyxStrokes), so there's nothing to
         -- do on the delayed-refresh timer here.
@@ -2519,7 +2833,7 @@ function Pencil:checkColorPickerTrigger()
     if self.color_picker_showing then return end
 
     local elapsed_ms = time.to_ms(time.now() - self.color_picker_start_time)
-    if elapsed_ms >= COLOR_PICKER_DELAY_MS then
+    if elapsed_ms >= (self.color_picker_delay_ms or COLOR_PICKER_DELAY_MS) then
         -- Time elapsed without moving too far - show color picker
         self:showColorPicker(self.pen_x, self.pen_y)
         self:resetColorPickerTracking()
@@ -5045,6 +5359,15 @@ end
 
 -- Handle page changes (paging mode)
 function Pencil:onPageUpdate(pageno)
+    -- Huawei: wipe the firmware ink overlay so this page's strokes don't bleed
+    -- onto the next page (in case the user turns before the delayed clear fires).
+    -- KOReader's own render of the new page already includes its saved strokes.
+    if self.huawei_ahw_active then
+        local ok, android = pcall(require, "android")
+        if ok and android and android.huaweiAhwClear then
+            android.huaweiAhwClear()
+        end
+    end
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
