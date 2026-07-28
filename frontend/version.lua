@@ -59,6 +59,14 @@ function Version:getShortVersion()
         local rev = self:getCurrentRevision()
         if (not rev or rev == "") then return "unknown" end
         local year, month, point, revision = rev:match("v(%d%d%d%d)%.(%d%d)%.?(%d?%d?)-?(%d*)")
+        -- Tags that don't match "vYYYY.MM[.P]" (e.g. a fork's or CI's custom
+        -- tag like "sony-dpt-v1") leave year+month nil, and the concat below
+        -- would error out during startup. Fall back to the raw rev string so
+        -- the app keeps booting.
+        if not year or not month then
+            self.short = rev
+            return self.short
+        end
         self.short = year .. "." .. month
         if point and point ~= "" then
             self.short = self.short .. "." .. point
