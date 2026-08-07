@@ -264,8 +264,14 @@ function Device:init()
         self.hasKeyboard = yes
     end
     -- check if we have a touchscreen
+    -- some devices (iReader/Zhangyue family, Mobiscribe Wave) report
+    -- ACONFIGURATION_TOUCHSCREEN_NOTOUCH despite having a working touchscreen,
+    -- so also trust the launcher's per-device quirk table, plus a manual
+    -- escape hatch in settings.reader.lua for devices not in that table yet.
     if android.lib.AConfiguration_getTouchscreen(android.app.config)
        ~= C.ACONFIGURATION_TOUCHSCREEN_NOTOUCH
+       or android.prop.brokenTouchReport
+       or G_reader_settings:isTrue("android_force_touch_device")
     then
         self.isTouchDevice = yes
     end
